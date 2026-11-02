@@ -132,11 +132,8 @@ export class GameRoom {
 
  broadcast(data){
   const message=JSON.stringify(data);
-
   for(const client of this.clients.values()){
-   try{
-    client.ws.send(message);
-   }catch{}
+   try{client.ws.send(message)}catch{}
   }
  }
 
@@ -146,17 +143,13 @@ export class GameRoom {
 
  assignHost(){
   const current=this.players.get(this.hostId);
-
   if(current?.online)return;
-
   const next=[...this.players.values()].find(p=>p.online);
-
   this.hostId=next?next.id:null;
  }
 
  snapshot(){
   this.assignHost();
-
   const host=this.players.get(this.hostId);
 
   return{
@@ -167,20 +160,12 @@ export class GameRoom {
    hostId:this.hostId,
    hostName:host?.name||null,
    players:[...this.players.values()].map(p=>({
-    id:p.id,
-    name:p.name,
-    team:p.team,
-    hp:p.hp,
-    alive:p.alive,
-    online:p.online,
-    x:p.x,
-    y:p.y,
-    immune:p.immune
+    id:p.id,name:p.name,team:p.team,
+    hp:p.hp,alive:p.alive,online:p.online,
+    x:p.x,y:p.y,immune:p.immune
    })),
    ghosts:this.ghosts.map(g=>({
-    x:g.x,
-    y:g.y,
-    idx:g.idx
+    x:g.x,y:g.y,idx:g.idx
    })),
    countdownAt:this.countdownAt,
    startedAt:this.startedAt,
@@ -195,7 +180,7 @@ export class GameRoom {
 
   this.cleanupOffline();
 
-  // 待機室が詰まった場合の救済
+  // 待機室の緊急初期化
   if(
    m.type==='emergencyReset'&&
    this.phase!=='playing'&&
@@ -205,14 +190,13 @@ export class GameRoom {
    return;
   }
 
-  // 初回の人数設定
+  // 初回人数設定
   if(
    m.type==='configure'&&
    this.phase==='setup'&&
    this.onlineCount()===0
   ){
    const n=Number(m.value);
-
    if(!Number.isInteger(n)||n<2||n>20){
     this.send(cid,{
      type:'error',
@@ -223,14 +207,9 @@ export class GameRoom {
 
    this.target=n;
    this.configured=true;
-
    await this.persist();
    await this.saveMatch();
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
+   this.broadcast({type:'state',...this.snapshot()});
    return;
   }
 
@@ -244,8 +223,7 @@ export class GameRoom {
 
    if(
     !Number.isInteger(n)||
-    n<2||
-    n>20||
+    n<2||n>20||
     n<this.onlineCount()
    ){
     this.send(cid,{
@@ -257,21 +235,15 @@ export class GameRoom {
 
    this.target=n;
    this.configured=true;
-
    await this.persist();
    await this.saveMatch();
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
+   this.broadcast({type:'state',...this.snapshot()});
    return;
   }
 
-  // 参加
+  // 参加・再接続・途中参加
   if(m.type==='join'){
    const token=String(m.token||'');
-
    let p=[...this.players.values()].find(
     x=>x.token===token&&token
    );
@@ -298,7 +270,6 @@ export class GameRoom {
     }
 
     const name=String(m.name||'').trim().slice(0,8);
-
     if(!name){
      this.send(cid,{
       type:'error',
@@ -307,7 +278,6 @@ export class GameRoom {
      return;
     }
 
-    // 名前の重複は許可
     p={
      id:this.nextId++,
      token:crypto.randomUUID(),
@@ -315,49 +285,33 @@ export class GameRoom {
      team:clamp(Number(m.team)||0,0,3),
      x:rnd(80,920),
      y:rnd(80,620),
-     vx:0,
-     vy:0,
-     dx:0,
-     dy:0,
-     hp:3,
-     alive:true,
-     immune:3,
-     online:true,
-     offlineAt:0
+     vx:0,vy:0,dx:0,dy:0,
+     hp:3,alive:true,immune:3,
+     online:true,offlineAt:0
     };
-
     this.players.set(p.id,p);
    }
 
-   // 同じ接続に古い参加者がいた場合
    if(c.pid&&c.pid!==p.id){
     const old=this.players.get(c.pid);
-
     if(old){
      old.online=false;
      old.offlineAt=Date.now();
-     old.dx=0;
-     old.dy=0;
+     old.dx=old.dy=0;
     }
-
     c.pid=null;
    }
 
-   // 同じ端末の古い接続を閉じる
    for(const [otherId,other] of this.clients){
     if(otherId!==cid&&other.pid===p.id){
      other.pid=null;
-
-     try{
-      other.ws.close(1000,'reconnected');
-     }catch{}
+     try{other.ws.close(1000,'reconnected')}catch{}
     }
    }
 
    c.pid=p.id;
    p.online=true;
    p.offlineAt=0;
-
    this.assignHost();
 
    this.send(cid,{
@@ -367,43 +321,55 @@ export class GameRoom {
    });
 
    await this.saveMatch();
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
+   this.broadcast({type:'state',...this.snapshot()});
    return;
   }
 
-  // 待機中の退出
+  // 待機室から退出
   if(
    m.type==='leave'&&
-   c.pid&&
-   this.phase==='setup'
+   c.pid&&this.phase==='setup'
   ){
    const leavingId=c.pid;
-
    this.players.delete(leavingId);
    c.pid=null;
 
-   if(this.hostId===leavingId){
-    this.hostId=null;
-   }
-
+   if(this.hostId===leavingId)this.hostId=null;
    this.assignHost();
 
    this.send(cid,{type:'removed'});
-
    await this.saveMatch();
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
+   this.broadcast({type:'state',...this.snapshot()});
    return;
   }
 
-  // オーナーだけ開始可能
+  // オーナーによる試合終了
+  if(
+   m.type==='endGame'&&
+   c.pid===this.hostId&&
+   (this.phase==='playing'||this.phase==='countdown')
+  ){
+   this.stopTimer();
+   this.phase='setup';
+   this.ghosts=[];
+   this.loser=null;
+   this.startedAt=0;
+   this.countdownAt=0;
+   this.endedAt=0;
+
+   for(const p of this.players.values()){
+    p.hp=3;
+    p.alive=true;
+    p.immune=3;
+    p.dx=p.dy=p.vx=p.vy=0;
+   }
+
+   await this.saveMatch();
+   this.broadcast({type:'state',...this.snapshot()});
+   return;
+  }
+
+  // オーナーだけが開始
   if(m.type==='start'){
    this.assignHost();
 
@@ -415,9 +381,7 @@ export class GameRoom {
     return;
    }
 
-   if(this.phase!=='setup'){
-    return;
-   }
+   if(this.phase!=='setup')return;
 
    if(this.onlineCount()<2){
     this.send(cid,{
@@ -429,14 +393,8 @@ export class GameRoom {
 
    this.phase='countdown';
    this.countdownAt=Date.now()+10000;
-
    await this.saveMatch();
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
-
+   this.broadcast({type:'state',...this.snapshot()});
    this.startTimer();
    return;
   }
@@ -454,23 +412,15 @@ export class GameRoom {
   // 移動
   if(m.type==='move'&&c.pid){
    const p=this.players.get(c.pid);
-
-   if(
-    !p||
-    !p.online||
-    !p.alive||
-    this.phase!=='playing'
-   ){
-    return;
-   }
+   if(!p||!p.online||!p.alive||
+      this.phase!=='playing')return;
 
    const x=Number(m.x)||0;
    const y=Number(m.y)||0;
-   const length=Math.hypot(x,y);
+   const len=Math.hypot(x,y);
 
-   p.dx=length>0?x/Math.max(1,length):0;
-   p.dy=length>0?y/Math.max(1,length):0;
-   return;
+   p.dx=len>0?x/Math.max(1,len):0;
+   p.dy=len>0?y/Math.max(1,len):0;
   }
  }
 
@@ -483,7 +433,6 @@ export class GameRoom {
 
  async saveMatch(){
   this.lastSaved=Date.now();
-
   await this.state.storage.put('match',{
    phase:this.phase,
    target:this.target,
@@ -501,15 +450,12 @@ export class GameRoom {
 
  cleanupOffline(){
   if(this.phase!=='setup')return;
-
   let changed=false;
   const now=Date.now();
 
   for(const [id,p] of this.players){
-   if(
-    !p.online&&
-    now-(p.offlineAt||0)>this.offlineGraceMs
-   ){
+   if(!p.online&&
+      now-(p.offlineAt||0)>this.offlineGraceMs){
     this.players.delete(id);
     changed=true;
    }
@@ -518,23 +464,17 @@ export class GameRoom {
   if(changed){
    this.assignHost();
    this.saveMatch().catch(()=>{});
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
+   this.broadcast({type:'state',...this.snapshot()});
   }
  }
 
  disconnect(cid){
   const c=this.clients.get(cid);
   if(!c)return;
-
   this.clients.delete(cid);
 
   if(c.pid){
    const p=this.players.get(c.pid);
-
    const stillConnected=[...this.clients.values()].some(
     other=>other.pid===c.pid
    );
@@ -542,26 +482,19 @@ export class GameRoom {
    if(p&&!stillConnected){
     p.online=false;
     p.offlineAt=Date.now();
-    p.dx=0;
-    p.dy=0;
+    p.dx=p.dy=0;
    }
   }
 
   this.assignHost();
   this.saveMatch().catch(()=>{});
-
-  this.broadcast({
-   type:'state',
-   ...this.snapshot()
-  });
+  this.broadcast({type:'state',...this.snapshot()});
  }
 
  async resetRoom(){
   this.stopTimer();
-
   this.players.clear();
   this.ghosts=[];
-
   this.phase='setup';
   this.target=20;
   this.configured=false;
@@ -572,24 +505,16 @@ export class GameRoom {
   this.endedAt=0;
   this.loser=null;
 
-  for(const c of this.clients.values()){
-   c.pid=null;
-  }
+  for(const c of this.clients.values())c.pid=null;
 
   await this.persist();
   await this.saveMatch();
-
   this.broadcast({type:'resetDone'});
-
-  this.broadcast({
-   type:'state',
-   ...this.snapshot()
-  });
+  this.broadcast({type:'state',...this.snapshot()});
  }
 
  async newRound(){
   this.stopTimer();
-
   this.phase='setup';
   this.ghosts=[];
   this.loser=null;
@@ -602,45 +527,29 @@ export class GameRoom {
     this.players.delete(id);
     continue;
    }
-
    p.hp=3;
    p.alive=true;
    p.immune=3;
-   p.dx=0;
-   p.dy=0;
-   p.vx=0;
-   p.vy=0;
+   p.dx=p.dy=p.vx=p.vy=0;
   }
 
   this.assignHost();
-
   await this.saveMatch();
-
-  this.broadcast({
-   type:'state',
-   ...this.snapshot()
-  });
+  this.broadcast({type:'state',...this.snapshot()});
  }
 
  startTimer(){
   if(this.timer)return;
-
   this.lastTick=Date.now();
 
   this.timer=setInterval(()=>{
-   try{
-    this.tick();
-   }catch(e){
-    console.error('Game tick error',e);
-   }
+   try{this.tick()}
+   catch(e){console.error('Game tick error',e)}
   },50);
  }
 
  stopTimer(){
-  if(this.timer){
-   clearInterval(this.timer);
-  }
-
+  if(this.timer)clearInterval(this.timer);
   this.timer=null;
  }
 
@@ -660,94 +569,57 @@ export class GameRoom {
     p.hp=3;
     p.alive=true;
     p.immune=3;
-    p.vx=0;
-    p.vy=0;
-    p.dx=0;
-    p.dy=0;
+    p.vx=p.vy=p.dx=p.dy=0;
     p.x=rnd(80,920);
     p.y=rnd(80,620);
    }
 
    this.saveMatch().catch(()=>{});
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
+   this.broadcast({type:'state',...this.snapshot()});
   }
 
   if(this.phase!=='playing')return;
-
-  // 通信切断で試合を初期化しない
   if(this.onlineCount()===0)return;
 
   const elapsed=(now-this.startedAt)/1000;
-
   const starts=[
-   [55,55],
-   [945,645],
-   [945,55],
-   [55,645],
-   [500,55],
-   [500,645],
-   [55,350],
-   [945,350],
-   [250,55],
-   [750,645],
-   [500,350]
+   [55,55],[945,645],[945,55],[55,645],
+   [500,55],[500,645],[55,350],[945,350],
+   [250,55],[750,645],[500,350]
   ];
 
-  // 鬼を最大11人まで登場させる
-  while(
-   this.ghosts.length<
-   Math.min(11,1+Math.floor(elapsed/15))
-  ){
+  while(this.ghosts.length<
+        Math.min(11,1+Math.floor(elapsed/15))){
    const i=this.ghosts.length;
-
    this.ghosts.push({
     x:starts[i][0],
     y:starts[i][1],
     idx:i,
-    vx:0,
-    vy:0,
+    vx:0,vy:0,
     wayX:rnd(90,910),
     wayY:rnd(90,610),
     nextTurn:now+rnd(250,1200)
    });
-
-   this.broadcast({
-    type:'ghost',
-    idx:i
-   });
+   this.broadcast({type:'ghost',idx:i});
   }
 
-  // プレイヤー移動
   for(const p of this.players.values()){
    if(!p.alive||!p.online)continue;
-
    p.immune=Math.max(0,p.immune-dt);
-
    const k=Math.min(1,dt*9);
-
    p.vx+=(p.dx*250-p.vx)*k;
    p.vy+=(p.dy*250-p.vy)*k;
-
    p.x=clamp(p.x+p.vx*dt,19,981);
    p.y=clamp(p.y+p.vy*dt,19,681);
   }
 
-  // 鬼の移動
   for(const g of this.ghosts){
    const living=[...this.players.values()].filter(
     p=>p.alive&&p.online
    );
-
    if(!living.length)break;
 
-   const ordered=[...living].sort(
-    (a,b)=>a.id-b.id
-   );
-
+   const ordered=[...living].sort((a,b)=>a.id-b.id);
    let target=ordered[g.idx%ordered.length];
 
    if(g.idx%3===1){
@@ -765,24 +637,16 @@ export class GameRoom {
    }
 
    if(g.idx===10){
-    // 11人目は不規則に移動
-    if(
-     now>=g.nextTurn||
-     Math.hypot(g.wayX-g.x,g.wayY-g.y)<75
-    ){
+    if(now>=g.nextTurn||
+       Math.hypot(g.wayX-g.x,g.wayY-g.y)<75){
      const a=rnd(0,Math.PI*2);
      const distance=rnd(160,590);
-
      g.wayX=clamp(
-      g.x+Math.cos(a)*distance,
-      65,935
+      g.x+Math.cos(a)*distance,65,935
      );
-
      g.wayY=clamp(
-      g.y+Math.sin(a)*distance,
-      65,635
+      g.y+Math.sin(a)*distance,65,635
      );
-
      g.nextTurn=now+rnd(350,1800);
     }
 
@@ -798,7 +662,6 @@ export class GameRoom {
     const dx=target.x-g.x;
     const dy=target.y-g.y;
     const d=Math.hypot(dx,dy)||1;
-
     const lateral=Math.sin(
      elapsed*.85+g.idx*1.8
     )*(.24+(g.idx%3)*.12);
@@ -806,10 +669,8 @@ export class GameRoom {
     let ux=dx/d-dy/d*lateral;
     let uy=dy/d+dx/d*lateral;
 
-    // 鬼同士の重なりを軽減
     for(const other of this.ghosts){
      if(other===g)continue;
-
      const sx=g.x-other.x;
      const sy=g.y-other.y;
      const dist=Math.hypot(sx,sy)||1;
@@ -824,7 +685,6 @@ export class GameRoom {
     const norm=Math.hypot(ux,uy)||1;
     const speed=98+g.idx*9+
      Math.min(elapsed,180)*.25;
-
     const k=Math.min(1,dt*3);
 
     g.vx+=(ux/norm*speed-g.vx)*k;
@@ -834,7 +694,6 @@ export class GameRoom {
    g.x=clamp(g.x+g.vx*dt,52,948);
    g.y=clamp(g.y+g.vy*dt,52,648);
 
-   // 当たり判定
    for(const p of living){
     if(
      p.immune<=0&&
@@ -842,40 +701,27 @@ export class GameRoom {
     ){
      p.hp--;
      p.immune=2.5;
-     p.dx=0;
-     p.dy=0;
-     p.vx=0;
-     p.vy=0;
+     p.dx=p.dy=p.vx=p.vy=0;
 
      if(p.hp<=0){
       p.alive=false;
-
       this.broadcast({
-       type:'hit',
-       id:p.id,
-       hp:0
+       type:'hit',id:p.id,hp:0
       });
      }else{
       p.x=rnd(100,900);
       p.y=rnd(100,600);
-
       this.broadcast({
-       type:'hit',
-       id:p.id,
-       hp:p.hp
+       type:'hit',id:p.id,hp:p.hp
       });
      }
     }
    }
   }
 
-  // チーム全滅判定
   const counts=[0,0,0,0];
-
   for(const p of this.players.values()){
-   if(p.alive&&p.online){
-    counts[p.team]++;
-   }
+   if(p.alive&&p.online)counts[p.team]++;
   }
 
   const teamsPresent=new Set(
@@ -892,23 +738,16 @@ export class GameRoom {
    this.phase='ended';
    this.endedAt=now;
    this.loser=dead[0];
-
-   this.broadcast({
-    type:'state',
-    ...this.snapshot()
-   });
-
+   this.broadcast({type:'state',...this.snapshot()});
    this.stopTimer();
    this.saveMatch().catch(()=>{});
    return;
   }
 
-  // 試合状態を定期保存
   if(now-this.lastSaved>2000){
    this.saveMatch().catch(()=>{});
   }
 
-  // 全員の位置を同期
   this.broadcast({
    type:'frame',
    players:[...this.players.values()].map(p=>[
