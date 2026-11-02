@@ -14,7 +14,7 @@ export class GameRoom {
  if(m.type==='leave'&&c.pid&&this.phase==='setup'){this.players.delete(c.pid);c.pid=null;if(this.players.size===0){this.configured=false;this.target=12;await this.persist();}this.send(cid,{type:'removed'});this.broadcast({type:'state',...this.snapshot()});return}
  if(m.type==='join'){const token=String(m.token||'');let p=[...this.players.values()].find(x=>x.token===token&&token);if(!p){if(this.phase!=='setup'||!this.configured||this.players.size>=this.target){this.send(cid,{type:'error',message:'現在は参加できません'});return}const name=String(m.name||'').trim().slice(0,8);if(!name){this.send(cid,{type:'error',message:'名前を入力してください'});return}if([...this.players.values()].some(x=>x.name===name)){this.send(cid,{type:'error',message:'その名前は登録済みです'});return}p={id:this.nextId++,token:crypto.randomUUID(),name,team:clamp(Number(m.team)||0,0,3),x:rnd(65,935),y:rnd(70,630),vx:0,vy:0,hp:3,alive:true,immune:2,online:true,dx:0,dy:0};this.players.set(p.id,p)}if(c.pid&&c.pid!==p.id)this.disconnect(cid);for(let [otherId,other] of this.clients)if(otherId!==cid&&other.pid===p.id){other.pid=null;try{other.ws.close(1000,'reconnected')}catch{}}c.pid=p.id;p.online=true;this.send(cid,{type:'joined',id:p.id,token:p.token});this.broadcast({type:'state',...this.snapshot()});return}
  if(m.type==='start'&&c.pid&&this.phase==='setup'&&this.players.size>0&&this.onlineCount()===this.players.size){this.phase='countdown';this.countdownAt=Date.now()+10000;this.broadcast({type:'state',...this.snapshot()});this.startTimer();return}
- if(m.type==='reset'&&c.pid&&this.phase==='ended'){this.stopTimer();this.players.clear();this.ghosts=[];this.phase='setup';this.configured=false;this.target=12;this.countdownAt=0;this.loser=null;await this.persist();this.broadcast({type:'state',...this.snapshot()});return}
+ if(m.type==='reset'&&this.phase==='ended'){this.stopTimer();this.broadcast({type:'resetDone'});this.players.clear();this.ghosts=[];this.phase='setup';this.configured=false;this.target=12;this.countdownAt=0;this.loser=null;await this.persist();this.broadcast({type:'state',...this.snapshot()});return}
  if(m.type==='move'&&c.pid){let p=this.players.get(c.pid);if(p&&p.alive&&this.phase==='playing'){let x=Number(m.x)||0,y=Number(m.y)||0,len=Math.hypot(x,y);p.dx=len>0?x/Math.max(1,len):0;p.dy=len>0?y/Math.max(1,len):0}return}
 
  }
@@ -24,8 +24,22 @@ export class GameRoom {
  startTimer(){if(!this.timer){this.lastTick=Date.now();this.timer=setInterval(()=>this.tick(),50)}}
  stopTimer(){if(this.timer)clearInterval(this.timer);this.timer=null}
  tick(){const now=Date.now(),dt=clamp((now-this.lastTick)/1000,0,.1);this.lastTick=now;if(this.phase==='countdown'){if(this.onlineCount()<this.players.size){this.phase='setup';this.countdownAt=0;this.stopTimer();this.broadcast({type:'state',...this.snapshot()});return}if(now>=this.countdownAt){this.phase='playing';this.startedAt=now;this.ghosts=[];for(let p of this.players.values()){p.hp=3;p.alive=true;p.immune=2;p.vx=p.vy=0;p.x=rnd(80,920);p.y=rnd(80,620)}this.broadcast({type:'state',...this.snapshot()})}else return}
- if(this.phase!=='playing')return;let elapsed=(now-this.startedAt)/1000;while(this.ghosts.length<Math.min(7,1+Math.floor(elapsed/20))){let i=this.ghosts.length;this.ghosts.push({x:i===1?950:50,y:i===2?640:50,idx:i,vx:0,vy:0});this.broadcast({type:'ghost',idx:i})}
+ if(this.phase!=='playing')return;let elapsed=(now-this.startedAt)/1000;while(this.ghosts.length<Math.min(7,1+Math.floor(elapsed/20))){let i=this.ghosts.length;const starts=[[55,55],[945,645],[945,55],[55,645],[500,55],[500,645],[55,350]];this.ghosts.push({x:starts[i][0],y:starts[i][1],idx:i,vx:0,vy:0,turn:Math.random()*6.28});this.broadcast({type:'ghost',idx:i})}
  for(let p of this.players.values()){if(!p.alive)continue;p.immune=Math.max(0,p.immune-dt);let k=Math.min(1,dt*9);p.vx+=(p.dx*250-p.vx)*k;p.vy+=(p.dy*250-p.vy)*k;p.x=clamp(p.x+p.vx*dt,19,981);p.y=clamp(p.y+p.vy*dt,19,681)}
- for(let g of this.ghosts){let living=[...this.players.values()].filter(p=>p.alive);if(!living.length)break;let p=living.reduce((a,b)=>Math.hypot(b.x-g.x,b.y-g.y)<Math.hypot(a.x-g.x,a.y-g.y)?b:a);let dx=p.x-g.x,dy=p.y-g.y,d=Math.hypot(dx,dy)||1,speed=105+g.idx*12+Math.min(elapsed,180)*.35,k=Math.min(1,dt*3);g.vx+=(dx/d*speed-g.vx)*k;g.vy+=(dy/d*speed-g.vy)*k;g.x=clamp(g.x+g.vx*dt,25,975);g.y=clamp(g.y+g.vy*dt,25,675);for(let q of living)if(q.immune<=0&&Math.hypot(q.x-g.x,q.y-g.y)<42){q.hp--;q.immune=2.5;q.dx=q.dy=0;q.vx=q.vy=0;if(q.hp<=0){q.alive=false;this.broadcast({type:'hit',id:q.id,hp:0})}else{q.x=rnd(100,900);q.y=rnd(100,600);this.broadcast({type:'hit',id:q.id,hp:q.hp})}}}
+ for(let g of this.ghosts){let living=[...this.players.values()].filter(p=>p.alive);if(!living.length)break;
+ // Each ghost uses a different target preference, rather than every ghost chasing the nearest player.
+ let ordered=[...living].sort((a,b)=>a.id-b.id);let p=ordered[g.idx%ordered.length];
+ if(g.idx%3===1)p=ordered.reduce((a,b)=>Math.hypot(b.x-g.x,b.y-g.y)>Math.hypot(a.x-g.x,a.y-g.y)?b:a);
+ if(g.idx%3===2)p=ordered.reduce((a,b)=>Math.hypot(b.x-g.x,b.y-g.y)<Math.hypot(a.x-g.x,a.y-g.y)?b:a);
+ let dx=p.x-g.x,dy=p.y-g.y,d=Math.hypot(dx,dy)||1;
+ // Distinct curved paths and separation steering prevent overlapping ghost sprites.
+ let lateral=Math.sin(elapsed*.85+g.idx*1.8)*(.24+(g.idx%3)*.12);
+ let ux=dx/d-dy/d*lateral,uy=dy/d+dx/d*lateral;
+ for(let other of this.ghosts){if(other===g)continue;let sx=g.x-other.x,sy=g.y-other.y,dist=Math.hypot(sx,sy)||1;if(dist<145){let force=(145-dist)/145*2.4;ux+=sx/dist*force;uy+=sy/dist*force}}
+ let norm=Math.hypot(ux,uy)||1,speed=98+g.idx*9+Math.min(elapsed,180)*.25,k=Math.min(1,dt*3);
+ g.vx+=(ux/norm*speed-g.vx)*k;g.vy+=(uy/norm*speed-g.vy)*k;
+ g.x=clamp(g.x+g.vx*dt,52,948);g.y=clamp(g.y+g.vy*dt,52,648);
+ for(let q of living)if(q.immune<=0&&Math.hypot(q.x-g.x,q.y-g.y)<65){q.hp--;q.immune=2.5;q.dx=q.dy=0;q.vx=q.vy=0;if(q.hp<=0){q.alive=false;this.broadcast({type:'hit',id:q.id,hp:0})}else{q.x=rnd(100,900);q.y=rnd(100,600);this.broadcast({type:'hit',id:q.id,hp:q.hp})}}
+ }
  let counts=[0,0,0,0];for(let p of this.players.values())if(p.alive)counts[p.team]++;let teamsPresent=new Set([...this.players.values()].map(p=>p.team));let dead=[...teamsPresent].filter(t=>counts[t]===0);if(dead.length){this.phase='ended';this.loser=dead[0];this.broadcast({type:'state',...this.snapshot()});this.stopTimer();return}this.broadcast({type:'frame',players:[...this.players.values()].map(p=>[p.id,Math.round(p.x),Math.round(p.y),p.hp,p.alive,p.immune>0]),ghosts:this.ghosts.map(g=>[Math.round(g.x),Math.round(g.y),g.idx]),elapsed:Math.floor(elapsed)})}
 }
