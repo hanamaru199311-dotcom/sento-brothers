@@ -23,66 +23,83 @@ export class GameRoom {
   this.phase='setup';
   this.target=20;
   this.configured=false;
-  this.startedAt=0;
-  this.lastTick=Date.now();
-  this.timer=null;
-  this.nextId=1;
-  this.offlineGraceMs=20000;
   this.hostId=null;
-  this.lastSaved=0;
+  this.nextId=1;
   this.countdownAt=0;
-  this.loser=null;
+  this.startedAt=0;
   this.endedAt=0;
+  this.loser=null;
+  this.timer=null;
+  this.lastTick=Date.now();
+  this.lastSaved=0;
+  this.offlineGraceMs=20000;
 
   this.state.blockConcurrencyWhile(async()=>{
    const cfg=await this.state.storage.get('config');
+   const saved=await this.state.storage.get('match');
+
    if(cfg){
     this.target=cfg.target||20;
     this.configured=!!cfg.configured;
    }
-   const saved=await this.state.storage.get('match');
+
    if(saved){
     this.phase=saved.phase||'setup';
-    this.players=new Map((saved.players||[]).map(p=>[
-     p.id,{
-      ...p,online:false,dx:0,dy:0,
-      offlineAt:Date.now()
-     }
-    ]));
-    this.ghosts=saved.ghosts||[];
+    this.target=saved.target||this.target;
+    this.configured=saved.configured??this.configured;
+    this.hostId=saved.hostId??null;
     this.nextId=saved.nextId||1;
-    this.hostId=saved.hostId||null;
     this.countdownAt=saved.countdownAt||0;
     this.startedAt=saved.startedAt||0;
+    this.endedAt=saved.endedAt||0;
     this.loser=saved.loser??null;
-    this.configured=saved.configured??this.configured;
-    this.target=saved.target||this.target;
-    if(this.phase==='playing'||this.phase==='countdown'){
-     this.startTimer();
-    }
+    this.ghosts=saved.ghosts||[];
+
+    this.players=new Map(
+     (saved.players||[]).map(p=>[
+      p.id,{
+       ...p,
+       online:false,
+       dx:0,
+       dy:0,
+       offlineAt:Date.now()
+      }
+     ])
+    );
+   }
+
+   if(this.phase==='playing'||this.phase==='countdown'){
+    this.startTimer();
    }
   });
  }
 
  async fetch(req){
-  const u=new URL(req.url);
-  if(u.pathname==='/api/state'){
+  const url=new URL(req.url);
+
+  if(url.pathname==='/api/state'){
    return Response.json(this.snapshot());
   }
-  if(u.pathname!=='/api/ws'||
-     req.headers.get('Upgrade')?.toLowerCase()!=='websocket'){
+
+  if(
+   url.pathname!=='/api/ws'||
+   req.headers.get('Upgrade')?.toLowerCase()!=='websocket'
+  ){
    return new Response('Not found',{status:404});
   }
 
   const pair=new WebSocketPair();
-  const client=pair[0],server=pair[1];
+  const client=pair[0];
+  const server=pair[1];
   server.accept();
+
   const cid=crypto.randomUUID();
   this.clients.set(cid,{ws:server,pid:null});
 
-  server.addEventListener('message',e=>{
+  server.addEventListener('message',event=>{
    try{
-    this.handle(cid,JSON.parse(e.data)).catch(()=>{
+    const message=JSON.parse(event.data);
+    this.handle(cid,message).catch(()=>{
      this.send(cid,{
       type:'error',
       message:'操作を処理できませんでした'
@@ -91,15 +108,20 @@ export class GameRoom {
    }catch{
     this.send(cid,{
      type:'error',
-     message:'操作を処理できませんでした'
+     message:'通信データを処理できませんでした'
     });
    }
   });
+
   server.addEventListener('close',()=>this.disconnect(cid));
   server.addEventListener('error',()=>this.disconnect(cid));
+
   this.send(cid,{type:'hello',...this.snapshot()});
 
-  return new Response(null,{status:101,webSocket:client});
+  return new Response(null,{
+   status:101,
+   webSocket:client
+  });
  }
 
  send(cid,data){
@@ -109,26 +131,56 @@ export class GameRoom {
  }
 
  broadcast(data){
-  const s=JSON.stringify(data);
-  for(const c of this.clients.values()){
-   try{c.ws.send(s)}catch{}
+  const message=JSON.stringify(data);
+
+  for(const client of this.clients.values()){
+   try{
+    client.ws.send(message);
+   }catch{}
   }
  }
 
+ onlineCount(){
+  return [...this.players.values()].filter(p=>p.online).length;
+ }
+
+ assignHost(){
+  const current=this.players.get(this.hostId);
+
+  if(current?.online)return;
+
+  const next=[...this.players.values()].find(p=>p.online);
+
+  this.hostId=next?next.id:null;
+ }
+
  snapshot(){
-  return {
+  this.assignHost();
+
+  const host=this.players.get(this.hostId);
+
+  return{
    phase:this.phase,
    target:this.target,
    configured:this.configured,
    joined:this.onlineCount(),
    hostId:this.hostId,
+   hostName:host?.name||null,
    players:[...this.players.values()].map(p=>({
-    id:p.id,name:p.name,team:p.team,
-    hp:p.hp,alive:p.alive,online:p.online,
-    x:p.x,y:p.y,immune:p.immune
+    id:p.id,
+    name:p.name,
+    team:p.team,
+    hp:p.hp,
+    alive:p.alive,
+    online:p.online,
+    x:p.x,
+    y:p.y,
+    immune:p.immune
    })),
    ghosts:this.ghosts.map(g=>({
-    x:g.x,y:g.y,idx:g.idx
+    x:g.x,
+    y:g.y,
+    idx:g.idx
    })),
    countdownAt:this.countdownAt,
    startedAt:this.startedAt,
@@ -140,19 +192,27 @@ export class GameRoom {
  async handle(cid,m){
   const c=this.clients.get(cid);
   if(!c)return;
+
   this.cleanupOffline();
 
-  if(m.type==='emergencyReset'&&
-     this.phase!=='playing'&&
-     this.phase!=='countdown'){
+  // 待機室が詰まった場合の救済
+  if(
+   m.type==='emergencyReset'&&
+   this.phase!=='playing'&&
+   this.phase!=='countdown'
+  ){
    await this.resetRoom();
    return;
   }
 
-  if(m.type==='configure'&&
-     this.phase==='setup'&&
-     this.onlineCount()===0){
+  // 初回の人数設定
+  if(
+   m.type==='configure'&&
+   this.phase==='setup'&&
+   this.onlineCount()===0
+  ){
    const n=Number(m.value);
+
    if(!Number.isInteger(n)||n<2||n>20){
     this.send(cid,{
      type:'error',
@@ -160,67 +220,85 @@ export class GameRoom {
     });
     return;
    }
+
    this.target=n;
    this.configured=true;
+
    await this.persist();
    await this.saveMatch();
-   this.broadcast({type:'state',...this.snapshot()});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
    return;
   }
 
-  if(m.type==='setTarget'&&
-     c.pid===this.hostId&&
-     this.phase==='setup'){
+  // オーナーによる人数変更
+  if(
+   m.type==='setTarget'&&
+   c.pid===this.hostId&&
+   this.phase==='setup'
+  ){
    const n=Number(m.value);
-   if(!Number.isInteger(n)||n<2||n>20||
-      n<this.onlineCount()){
+
+   if(
+    !Number.isInteger(n)||
+    n<2||
+    n>20||
+    n<this.onlineCount()
+   ){
     this.send(cid,{
      type:'error',
      message:'現在の参加人数以上、20人以下にしてください'
     });
     return;
    }
+
    this.target=n;
    this.configured=true;
+
    await this.persist();
    await this.saveMatch();
-   this.broadcast({type:'state',...this.snapshot()});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
    return;
   }
 
-  if(m.type==='leave'&&c.pid&&this.phase==='setup'){
-   if(this.hostId===c.pid)this.hostId=null;
-   this.players.delete(c.pid);
-   c.pid=null;
-   if(this.players.size===0){
-    this.configured=false;
-    this.target=20;
-    await this.persist();
-   }
-   this.assignHost();
-   await this.saveMatch();
-   this.send(cid,{type:'removed'});
-   this.broadcast({type:'state',...this.snapshot()});
-   return;
-  }
-
+  // 参加
   if(m.type==='join'){
    const token=String(m.token||'');
+
    let p=[...this.players.values()].find(
     x=>x.token===token&&token
    );
-   if(!p&&c.pid)p=this.players.get(c.pid);
+
+   if(!p&&c.pid){
+    p=this.players.get(c.pid);
+   }
 
    if(!p){
-    if(this.phase==='ended'||!this.configured||
-       this.onlineCount()>=this.target){
+    if(this.phase==='ended'){
      this.send(cid,{
       type:'error',
-      message:'現在は参加できません'
+      message:'次のゲーム開始までお待ちください'
      });
      return;
     }
+
+    if(this.onlineCount()>=this.target){
+     this.send(cid,{
+      type:'error',
+      message:'満員です'
+     });
+     return;
+    }
+
     const name=String(m.name||'').trim().slice(0,8);
+
     if(!name){
      this.send(cid,{
       type:'error',
@@ -229,33 +307,47 @@ export class GameRoom {
      return;
     }
 
+    // 名前の重複は許可
     p={
      id:this.nextId++,
      token:crypto.randomUUID(),
      name,
      team:clamp(Number(m.team)||0,0,3),
-     x:rnd(65,935),
-     y:rnd(70,630),
-     vx:0,vy:0,
-     hp:3,alive:true,immune:2,
-     online:true,dx:0,dy:0
+     x:rnd(80,920),
+     y:rnd(80,620),
+     vx:0,
+     vy:0,
+     dx:0,
+     dy:0,
+     hp:3,
+     alive:true,
+     immune:3,
+     online:true,
+     offlineAt:0
     };
+
     this.players.set(p.id,p);
-    if(this.hostId===null)this.hostId=p.id;
    }
 
+   // 同じ接続に古い参加者がいた場合
    if(c.pid&&c.pid!==p.id){
     const old=this.players.get(c.pid);
+
     if(old){
      old.online=false;
      old.offlineAt=Date.now();
+     old.dx=0;
+     old.dy=0;
     }
+
     c.pid=null;
    }
 
+   // 同じ端末の古い接続を閉じる
    for(const [otherId,other] of this.clients){
     if(otherId!==cid&&other.pid===p.id){
      other.pid=null;
+
      try{
       other.ws.close(1000,'reconnected');
      }catch{}
@@ -265,43 +357,120 @@ export class GameRoom {
    c.pid=p.id;
    p.online=true;
    p.offlineAt=0;
+
    this.assignHost();
+
    this.send(cid,{
-    type:'joined',id:p.id,token:p.token
+    type:'joined',
+    id:p.id,
+    token:p.token
    });
+
    await this.saveMatch();
-   this.broadcast({type:'state',...this.snapshot()});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
    return;
   }
 
-  if(m.type==='start'&&
-     c.pid===this.hostId&&
-     this.phase==='setup'&&
-     this.onlineCount()>=2){
+  // 待機中の退出
+  if(
+   m.type==='leave'&&
+   c.pid&&
+   this.phase==='setup'
+  ){
+   const leavingId=c.pid;
+
+   this.players.delete(leavingId);
+   c.pid=null;
+
+   if(this.hostId===leavingId){
+    this.hostId=null;
+   }
+
+   this.assignHost();
+
+   this.send(cid,{type:'removed'});
+
+   await this.saveMatch();
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
+   return;
+  }
+
+  // オーナーだけ開始可能
+  if(m.type==='start'){
+   this.assignHost();
+
+   if(c.pid!==this.hostId){
+    this.send(cid,{
+     type:'error',
+     message:'オーナーだけが開始できます'
+    });
+    return;
+   }
+
+   if(this.phase!=='setup'){
+    return;
+   }
+
+   if(this.onlineCount()<2){
+    this.send(cid,{
+     type:'error',
+     message:'2人以上で開始できます'
+    });
+    return;
+   }
+
    this.phase='countdown';
    this.countdownAt=Date.now()+10000;
+
    await this.saveMatch();
-   this.broadcast({type:'state',...this.snapshot()});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
+
    this.startTimer();
    return;
   }
 
-  if(m.type==='reset'&&
-     c.pid===this.hostId&&
-     this.phase==='ended'){
+  // 再戦
+  if(
+   m.type==='reset'&&
+   c.pid===this.hostId&&
+   this.phase==='ended'
+  ){
    await this.newRound();
    return;
   }
 
+  // 移動
   if(m.type==='move'&&c.pid){
    const p=this.players.get(c.pid);
-   if(p&&p.alive&&this.phase==='playing'){
-    const x=Number(m.x)||0;
-    const y=Number(m.y)||0;
-    const len=Math.hypot(x,y);
-    p.dx=len>0?x/Math.max(1,len):0;
-    p.dy=len>0?y/Math.max(1,len):0;
+
+   if(
+    !p||
+    !p.online||
+    !p.alive||
+    this.phase!=='playing'
+   ){
+    return;
    }
+
+   const x=Number(m.x)||0;
+   const y=Number(m.y)||0;
+   const length=Math.hypot(x,y);
+
+   p.dx=length>0?x/Math.max(1,length):0;
+   p.dy=length>0?y/Math.max(1,length):0;
+   return;
   }
  }
 
@@ -314,60 +483,94 @@ export class GameRoom {
 
  async saveMatch(){
   this.lastSaved=Date.now();
+
   await this.state.storage.put('match',{
    phase:this.phase,
-   players:[...this.players.values()],
-   ghosts:this.ghosts,
-   nextId:this.nextId,
+   target:this.target,
+   configured:this.configured,
    hostId:this.hostId,
+   nextId:this.nextId,
    countdownAt:this.countdownAt,
    startedAt:this.startedAt,
+   endedAt:this.endedAt,
    loser:this.loser,
-   configured:this.configured,
-   target:this.target
+   players:[...this.players.values()],
+   ghosts:this.ghosts
   });
  }
 
- assignHost(){
-  if(this.hostId&&
-     this.players.get(this.hostId)?.online)return;
-  const online=[...this.players.values()].find(p=>p.online);
-  this.hostId=online?online.id:null;
+ cleanupOffline(){
+  if(this.phase!=='setup')return;
+
+  let changed=false;
+  const now=Date.now();
+
+  for(const [id,p] of this.players){
+   if(
+    !p.online&&
+    now-(p.offlineAt||0)>this.offlineGraceMs
+   ){
+    this.players.delete(id);
+    changed=true;
+   }
+  }
+
+  if(changed){
+   this.assignHost();
+   this.saveMatch().catch(()=>{});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
+  }
  }
 
- async newRound(){
-  this.stopTimer();
-  this.phase='setup';
-  this.ghosts=[];
-  this.loser=null;
-  this.countdownAt=0;
-  this.startedAt=0;
+ disconnect(cid){
+  const c=this.clients.get(cid);
+  if(!c)return;
 
-  for(const p of this.players.values()){
-   p.hp=3;
-   p.alive=true;
-   p.immune=2;
-   p.dx=p.dy=p.vx=p.vy=0;
+  this.clients.delete(cid);
+
+  if(c.pid){
+   const p=this.players.get(c.pid);
+
+   const stillConnected=[...this.clients.values()].some(
+    other=>other.pid===c.pid
+   );
+
+   if(p&&!stillConnected){
+    p.online=false;
+    p.offlineAt=Date.now();
+    p.dx=0;
+    p.dy=0;
+   }
   }
 
   this.assignHost();
-  await this.saveMatch();
-  this.broadcast({type:'state',...this.snapshot()});
+  this.saveMatch().catch(()=>{});
+
+  this.broadcast({
+   type:'state',
+   ...this.snapshot()
+  });
  }
 
  async resetRoom(){
   this.stopTimer();
-  this.broadcast({type:'resetDone'});
+
   this.players.clear();
   this.ghosts=[];
+
   this.phase='setup';
-  this.configured=false;
   this.target=20;
+  this.configured=false;
+  this.hostId=null;
+  this.nextId=1;
   this.countdownAt=0;
   this.startedAt=0;
-  this.loser=null;
   this.endedAt=0;
-  this.hostId=null;
+  this.loser=null;
 
   for(const c of this.clients.values()){
    c.pid=null;
@@ -375,62 +578,69 @@ export class GameRoom {
 
   await this.persist();
   await this.saveMatch();
-  this.broadcast({type:'state',...this.snapshot()});
+
+  this.broadcast({type:'resetDone'});
+
+  this.broadcast({
+   type:'state',
+   ...this.snapshot()
+  });
  }
 
- disconnect(cid){
-  const c=this.clients.get(cid);
-  if(!c)return;
-  this.clients.delete(cid);
+ async newRound(){
+  this.stopTimer();
 
-  if(c.pid){
-   const p=this.players.get(c.pid);
-   if(p&&![...this.clients.values()].some(
-    other=>other.pid===p.id
-   )){
-    p.online=false;
-    p.offlineAt=Date.now();
-    p.dx=p.dy=0;
+  this.phase='setup';
+  this.ghosts=[];
+  this.loser=null;
+  this.countdownAt=0;
+  this.startedAt=0;
+  this.endedAt=0;
+
+  for(const [id,p] of this.players){
+   if(!p.online){
+    this.players.delete(id);
+    continue;
    }
+
+   p.hp=3;
+   p.alive=true;
+   p.immune=3;
+   p.dx=0;
+   p.dy=0;
+   p.vx=0;
+   p.vy=0;
   }
 
   this.assignHost();
-  this.saveMatch().catch(()=>{});
-  this.broadcast({type:'state',...this.snapshot()});
- }
 
- onlineCount(){
-  return [...this.players.values()].filter(
-   p=>p.online
-  ).length;
- }
+  await this.saveMatch();
 
- cleanupOffline(){
-  if(this.phase!=='setup')return;
-  let changed=false;
-  for(const [id,p] of this.players){
-   if(!p.online&&
-      Date.now()-(p.offlineAt||0)>this.offlineGraceMs){
-    this.players.delete(id);
-    changed=true;
-   }
-  }
-  if(changed){
-   this.assignHost();
-   this.saveMatch().catch(()=>{});
-   this.broadcast({type:'state',...this.snapshot()});
-  }
+  this.broadcast({
+   type:'state',
+   ...this.snapshot()
+  });
  }
 
  startTimer(){
-  if(!this.timer){
-   this.lastTick=Date.now();
-   this.timer=setInterval(()=>this.tick(),50);
-  }
+  if(this.timer)return;
+
+  this.lastTick=Date.now();
+
+  this.timer=setInterval(()=>{
+   try{
+    this.tick();
+   }catch(e){
+    console.error('Game tick error',e);
+   }
+  },50);
  }
 
  stopTimer(){
-  if(this.timer)clearInterval(this.timer);
+  if(this.timer){
+   clearInterval(this.timer);
+  }
+
   this.timer=null;
  }
 
@@ -439,106 +649,140 @@ export class GameRoom {
   const dt=clamp((now-this.lastTick)/1000,0,.1);
   this.lastTick=now;
 
-  if(this.phase==='playing'&&this.onlineCount()>0){
-   for(const [id,p] of this.players){
-    if(!p.online&&
-       now-(p.offlineAt||now)>this.offlineGraceMs){
-     this.players.delete(id);
-    }
-   }
-  }
-
   if(this.phase==='countdown'){
-   if(this.onlineCount()===0)return;
-   if(now>=this.countdownAt){
-    this.phase='playing';
-    this.startedAt=now;
-    this.ghosts=[];
+   if(now<this.countdownAt)return;
 
-    for(const p of this.players.values()){
-     p.hp=3;
-     p.alive=true;
-     p.immune=2;
-     p.vx=p.vy=0;
-     p.x=rnd(80,920);
-     p.y=rnd(80,620);
-    }
+   this.phase='playing';
+   this.startedAt=now;
+   this.ghosts=[];
 
-    this.saveMatch().catch(()=>{});
-    this.broadcast({type:'state',...this.snapshot()});
-   }else return;
+   for(const p of this.players.values()){
+    p.hp=3;
+    p.alive=true;
+    p.immune=3;
+    p.vx=0;
+    p.vy=0;
+    p.dx=0;
+    p.dy=0;
+    p.x=rnd(80,920);
+    p.y=rnd(80,620);
+   }
+
+   this.saveMatch().catch(()=>{});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
   }
 
   if(this.phase!=='playing')return;
+
+  // 通信切断で試合を初期化しない
   if(this.onlineCount()===0)return;
 
   const elapsed=(now-this.startedAt)/1000;
+
   const starts=[
-   [55,55],[945,645],[945,55],[55,645],
-   [500,55],[500,645],[55,350],[945,350],
-   [250,55],[750,645],[500,350]
+   [55,55],
+   [945,645],
+   [945,55],
+   [55,645],
+   [500,55],
+   [500,645],
+   [55,350],
+   [945,350],
+   [250,55],
+   [750,645],
+   [500,350]
   ];
 
-  while(this.ghosts.length<
-        Math.min(11,1+Math.floor(elapsed/15))){
+  // 鬼を最大11人まで登場させる
+  while(
+   this.ghosts.length<
+   Math.min(11,1+Math.floor(elapsed/15))
+  ){
    const i=this.ghosts.length;
+
    this.ghosts.push({
     x:starts[i][0],
     y:starts[i][1],
     idx:i,
-    vx:0,vy:0,
-    turn:Math.random()*6.28,
+    vx:0,
+    vy:0,
     wayX:rnd(90,910),
     wayY:rnd(90,610),
     nextTurn:now+rnd(250,1200)
    });
-   this.broadcast({type:'ghost',idx:i});
+
+   this.broadcast({
+    type:'ghost',
+    idx:i
+   });
   }
 
+  // プレイヤー移動
   for(const p of this.players.values()){
-   if(!p.alive)continue;
+   if(!p.alive||!p.online)continue;
+
    p.immune=Math.max(0,p.immune-dt);
+
    const k=Math.min(1,dt*9);
+
    p.vx+=(p.dx*250-p.vx)*k;
    p.vy+=(p.dy*250-p.vy)*k;
+
    p.x=clamp(p.x+p.vx*dt,19,981);
    p.y=clamp(p.y+p.vy*dt,19,681);
   }
 
+  // 鬼の移動
   for(const g of this.ghosts){
    const living=[...this.players.values()].filter(
-    p=>p.alive
+    p=>p.alive&&p.online
    );
+
    if(!living.length)break;
 
-   const ordered=[...living].sort((a,b)=>a.id-b.id);
-   let p=ordered[g.idx%ordered.length];
+   const ordered=[...living].sort(
+    (a,b)=>a.id-b.id
+   );
+
+   let target=ordered[g.idx%ordered.length];
 
    if(g.idx%3===1){
-    p=ordered.reduce((a,b)=>
+    target=ordered.reduce((a,b)=>
      Math.hypot(b.x-g.x,b.y-g.y)>
      Math.hypot(a.x-g.x,a.y-g.y)?b:a
     );
    }
 
    if(g.idx%3===2){
-    p=ordered.reduce((a,b)=>
+    target=ordered.reduce((a,b)=>
      Math.hypot(b.x-g.x,b.y-g.y)<
      Math.hypot(a.x-g.x,a.y-g.y)?b:a
     );
    }
 
    if(g.idx===10){
-    if(now>=g.nextTurn||
-       Math.hypot(g.wayX-g.x,g.wayY-g.y)<75){
+    // 11人目は不規則に移動
+    if(
+     now>=g.nextTurn||
+     Math.hypot(g.wayX-g.x,g.wayY-g.y)<75
+    ){
      const a=rnd(0,Math.PI*2);
      const distance=rnd(160,590);
+
      g.wayX=clamp(
-      g.x+Math.cos(a)*distance,65,935
+      g.x+Math.cos(a)*distance,
+      65,935
      );
+
      g.wayY=clamp(
-      g.y+Math.sin(a)*distance,65,635
+      g.y+Math.sin(a)*distance,
+      65,635
      );
+
      g.nextTurn=now+rnd(350,1800);
     }
 
@@ -547,39 +791,29 @@ export class GameRoom {
     const d=Math.hypot(dx,dy)||1;
     const speed=135+35*Math.sin(elapsed*2.7);
     const k=Math.min(1,dt*7);
-    let ux=dx/d,uy=dy/d;
 
-    for(const other of this.ghosts){
-     if(other===g)continue;
-     const sx=g.x-other.x;
-     const sy=g.y-other.y;
-     const dist=Math.hypot(sx,sy)||1;
-     if(dist<130){
-      ux+=sx/dist*(130-dist)/130*2;
-      uy+=sy/dist*(130-dist)/130*2;
-     }
-    }
-
-    const norm=Math.hypot(ux,uy)||1;
-    g.vx+=(ux/norm*speed-g.vx)*k;
-    g.vy+=(uy/norm*speed-g.vy)*k;
-    g.x=clamp(g.x+g.vx*dt,52,948);
-    g.y=clamp(g.y+g.vy*dt,52,648);
+    g.vx+=(dx/d*speed-g.vx)*k;
+    g.vy+=(dy/d*speed-g.vy)*k;
    }else{
-    const dx=p.x-g.x;
-    const dy=p.y-g.y;
+    const dx=target.x-g.x;
+    const dy=target.y-g.y;
     const d=Math.hypot(dx,dy)||1;
+
     const lateral=Math.sin(
      elapsed*.85+g.idx*1.8
     )*(.24+(g.idx%3)*.12);
+
     let ux=dx/d-dy/d*lateral;
     let uy=dy/d+dx/d*lateral;
 
+    // 鬼同士の重なりを軽減
     for(const other of this.ghosts){
      if(other===g)continue;
+
      const sx=g.x-other.x;
      const sy=g.y-other.y;
      const dist=Math.hypot(sx,sy)||1;
+
      if(dist<145){
       const force=(145-dist)/145*2.4;
       ux+=sx/dist*force;
@@ -590,63 +824,91 @@ export class GameRoom {
     const norm=Math.hypot(ux,uy)||1;
     const speed=98+g.idx*9+
      Math.min(elapsed,180)*.25;
+
     const k=Math.min(1,dt*3);
+
     g.vx+=(ux/norm*speed-g.vx)*k;
     g.vy+=(uy/norm*speed-g.vy)*k;
-    g.x=clamp(g.x+g.vx*dt,52,948);
-    g.y=clamp(g.y+g.vy*dt,52,648);
    }
 
-   for(const q of living){
-    if(q.immune<=0&&
-       Math.hypot(q.x-g.x,q.y-g.y)<65){
-     q.hp--;
-     q.immune=2.5;
-     q.dx=q.dy=0;
-     q.vx=q.vy=0;
+   g.x=clamp(g.x+g.vx*dt,52,948);
+   g.y=clamp(g.y+g.vy*dt,52,648);
 
-     if(q.hp<=0){
-      q.alive=false;
+   // 当たり判定
+   for(const p of living){
+    if(
+     p.immune<=0&&
+     Math.hypot(p.x-g.x,p.y-g.y)<65
+    ){
+     p.hp--;
+     p.immune=2.5;
+     p.dx=0;
+     p.dy=0;
+     p.vx=0;
+     p.vy=0;
+
+     if(p.hp<=0){
+      p.alive=false;
+
       this.broadcast({
-       type:'hit',id:q.id,hp:0
+       type:'hit',
+       id:p.id,
+       hp:0
       });
      }else{
-      q.x=rnd(100,900);
-      q.y=rnd(100,600);
+      p.x=rnd(100,900);
+      p.y=rnd(100,600);
+
       this.broadcast({
-       type:'hit',id:q.id,hp:q.hp
+       type:'hit',
+       id:p.id,
+       hp:p.hp
       });
      }
     }
    }
   }
 
+  // チーム全滅判定
   const counts=[0,0,0,0];
+
   for(const p of this.players.values()){
-   if(p.alive)counts[p.team]++;
+   if(p.alive&&p.online){
+    counts[p.team]++;
+   }
   }
 
   const teamsPresent=new Set(
-   [...this.players.values()].map(p=>p.team)
+   [...this.players.values()]
+    .filter(p=>p.online)
+    .map(p=>p.team)
   );
+
   const dead=[...teamsPresent].filter(
-   t=>counts[t]===0
+   team=>counts[team]===0
   );
 
   if(dead.length){
    this.phase='ended';
-   this.endedAt=Date.now();
+   this.endedAt=now;
    this.loser=dead[0];
-   this.broadcast({type:'state',...this.snapshot()});
+
+   this.broadcast({
+    type:'state',
+    ...this.snapshot()
+   });
+
    this.stopTimer();
    this.saveMatch().catch(()=>{});
    return;
   }
 
+  // 試合状態を定期保存
   if(now-this.lastSaved>2000){
    this.saveMatch().catch(()=>{});
   }
 
+  // 全員の位置を同期
   this.broadcast({
    type:'frame',
    players:[...this.players.values()].map(p=>[
